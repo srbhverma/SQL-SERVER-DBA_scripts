@@ -1,0 +1,595 @@
+--Powershell Script for Disk / MountPoint size:
+--------------------------------------------------------
+$BlockSizeKB = @{Name="BlockSize(KB)";expression={[math]::round(($_.Blocksize/ 1024),2)}}
+$TotalGB = @{Name="Capacity(GB)";expression={[math]::round(($_.Capacity/ 1073741824),2)}}
+$FreeGB = @{Name="FreeSpace(GB)";expression={[math]::round(($_.FreeSpace / 1073741824),2)}}
+$FreePerc = @{Name="Free(%)";expression={[math]::round(((($_.FreeSpace / 1073741824)/($_.Capacity / 1073741824)) * 100),0)}}
+
+gwmi win32_volume|where-object {$_.filesystem -match “ntfs”}|ft label,name,$BlockSizeKB,$TotalGB, $FreeGB, $FreePerc
+
+
+---------------
+Declare @str nvarchar(200)
+Declare @CurrentDate datetime
+Declare @DatelessHour datetime
+set @str = 'Error'
+Set @CurrentDate = getdate()
+Set @DatelessHour = DATEADD(hh,-12,@CurrentDate)
+EXEC xp_ReadErrorLog 0, 1, @str, NULL, @DatelessHour, @CurrentDate
+
+GO 
+
+Declare @str nvarchar(200)
+Declare @CurrentDate datetime
+Declare @DatelessHour datetime
+set @str = 'Deadlock'
+Set @CurrentDate = getdate()
+Set @DatelessHour = DATEADD(hh,-12,@CurrentDate)
+EXEC xp_ReadErrorLog 0, 1, @str, NULL, @DatelessHour, @CurrentDate
+
+GO 
+
+--Check Backup:
+-------------------------
+use msdb
+go
+
+-- D = Full, I = Differential and L = Log.
+-- There are other types of backups too but those are the primary ones.
+SELECT backupset.database_name, 
+    MAX(CASE WHEN backupset.type = 'D' THEN backupset.backup_finish_date ELSE NULL END) AS LastFullBackup,
+    MAX(CASE WHEN backupset.type = 'I' THEN backupset.backup_finish_date ELSE NULL END) AS LastDifferential,
+    MAX(CASE WHEN backupset.type = 'L' THEN backupset.backup_finish_date ELSE NULL END) AS LastLog
+FROM msdb.dbo.backupset 
+inner join master.dbo.sysdatabases on (backupset.database_name = sysdatabases.name)
+GROUP BY backupset.database_name
+ORDER BY backupset.database_name DESC
+
+-----Error Log 
+
+DECLARE @fromDate datetime 
+DECLARE @toDate datetime 
+
+set @fromDate = DATEADD(hh,-12, GETDATE()); 
+set @toDate = GETDATE() ; 
+EXEC master.dbo.xp_readerrorlog 0,1,NULL, NULL, @fromDate, @toDate, 'DESC'
+
+
+--Check T-Log Space:
+---------------------------
+
+
+DBCC SQLPERF(LOGSPACE)
+
+--File and space used 
+SELECT DB_NAME(database_id) AS DatabaseName,
+Name AS Logical_Name, type_desc , name , 
+(size*8)/1024 SizeMB, Physical_Name 
+FROM sys.master_files
+order by [SizeMB] desc 
+
+
+
+--Replication job progress 
+SELECT publisher
+    , publisher_db
+    , publication
+    , agent_name
+    , last_distsync
+    , CASE
+        WHEN status = 1 THEN 'Started'
+        WHEN status = 2 THEN 'Succeeded'
+        WHEN status = 3 THEN 'In progress'
+        WHEN status = 4 THEN 'Idle'
+        WHEN status = 5 THEN 'Retrying'
+        WHEN status = 6 THEN 'Failed'
+    END AS StatedStates
+    --, *
+FROM distribution..MSreplication_monitordata
+
+--Replication errors 
+SELECT 
+	error_text
+	, [time]
+FROM distribution..MSrepl_errors
+ORDER BY [time] DESC
+
+DBCC opentran(databasename) 
+
+--------------------- Backup details
+
+
+SELECT      database_name,   physical_device_name,
+               Max( backup_finish_date) as lastestbackupdate, 	
+			  Max( backup_size/1024.0/1024.0) AS BackupSizeMB 					
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily m ON b.media_set_id = m.media_set_id
+where physical_device_name like '%.bak'
+group by database_name,   physical_device_name
+order by [lastestbackupdate] desc 
+
+---Database location details 
+
+SELECT
+    db.name AS DBName,
+	db.state_desc Status,
+	mf.name FileName,
+    Physical_Name AS FileLocation
+FROM
+    sys.master_files mf
+INNER JOIN 
+    sys.databases db ON db.database_id = mf.database_id
+	
+	
+	---------------------CHECKDB 
+	
+	
+DBCC checkdb (database name ) WITH NO_INFOMSGS
+go
+
+
+--------------  we can retrieve database sizes using below query:
+
+SELECT [Database Name] = DB_NAME(database_id),
+
+       [Type] = CASE WHEN Type_Desc = 'ROWS' THEN 'Data File(s)'
+
+                     WHEN Type_Desc = 'LOG'  THEN 'Log File(s)'
+
+                     ELSE Type_Desc END,
+
+       [Size in MB] = CAST( ((SUM(Size)* 8) / 1024.0) AS DECIMAL(18,2) )
+
+FROM   sys.master_files
+
+— Uncomment if you need to query for a particular database
+
+— WHERE      database_id = DB_ID(‘Database Name’)
+
+GROUP BY      GROUPING SETS
+
+              (
+
+                     (DB_NAME(database_id), Type_Desc),
+
+                     (DB_NAME(database_id))
+
+              )
+
+ORDER BY      DB_NAME(database_id), Type_Desc DESC
+
+GO
+
+---------------------------------------logspace 
+
+
+
+CREATE TABLE #logspace
+( [dbname] sysname
+, logSizeMB float
+, logSpaceUsedPct float
+, Status int);
+
+INSERT INTO #logspace
+EXEC ('DBCC SQLPERF(LOGSPACE)')
+
+SELECT dbname
+, logSizeMB
+, logSpaceUsedPct
+, logSizeMB - (logSizeMB * logSpaceUsedPct / 100) AS LogSpaceUnusedMB
+FROM #logspace
+ORDER BY LogSpaceUnusedMB DESC;  
+
+drop table #logspace
+
+---Run this query in master to see what your log may be waiting on to truncate.
+
+SELECT Name, log_reuse_wait_desc FROM sys.databases
+
+--What you’ll get here is a result that tells you what the log is waiting for before it can reuse the VLFs, 
+--and in this case, kill them so you can shrink the file.  
+--There are any number of things that can show up here as the reason.  
+--You could be waiting on a long transaction, or on a log backup, or on replication, etc.--
+--Create the database audit specification in each database 
+
+
+DECLARE @command varchar(1000)
+
+SELECT @command = 
+'IF ''?'' NOT IN(''master'', ''model'', ''msdb'', ''tempdb'') BEGIN USE ? 
+EXEC(''DBCC CHECKB WITH WITH ESTIMATEONLY'') END'
+
+EXEC sp_MSforeachdb @command
+
+
+------------------------------------------------------
+
+set quoted_identifier on
+
+EXEC sp_msforeachdb "
+IF '?' not in ('tempdb')
+begin
+    exec ('ALTER DATABASE [?] SET RECOVERY SIMPLE;')
+    print '?'
+end "
+
+-----------------------------------logins and their access level 
+
+SELECT SR.[name] AS role__name, [server_principals].name AS login__name                               
+FROM sys.[server_role_members] 
+INNER JOIN sys.[server_principals] 	
+ON [server_role_members].[member_principal_id] = [server_principals].[principal_id]
+INNER JOIN 	(		SELECT [principal_id], name		FROM sys.[server_principals]		WHERE [type_desc] = 'SERVER_ROLE'	)
+ AS SR ON [server_role_members].[role_principal_id] = SR.[principal_id] 
+ORDER BY SR.name, [server_principals].[name];
+
+----------------------------------
+SET NOCOUNT ON;
+
+DECLARE @user_name    SYSNAME
+        , @login_name SYSNAME;
+
+SELECT @user_name = 'FISERVCLOUDTEST\DL_GSBuild-Team',
+       @login_name ='FISERVCLOUDTEST\DL_GSBuild-Team'
+
+SELECT '
+    USE ' + QUOTENAME(NAME) + ';
+
+    CREATE USER ' + QUOTENAME(@user_name)
+       + ' FOR LOGIN ' + QUOTENAME(@login_name)
+       + ' ;
+
+    EXEC sys.sp_addrolemember
+      ''db_owner'',
+      ''' + @user_name + ''';
+GO
+'
+FROM   sys.databases
+WHERE  database_id > 4
+       AND state_desc = 'ONLINE' 
+	   --------------------------
+	   
+	   *************************
+*
+* Script written by Dale Kelly 11/23/2011
+* Revision 1.0
+* Purpose: This script searches all databases for orphaned users
+* and displays a list. If desired the orphaned users can be deleted
+*
+***********************/
+Use master
+Go
+Create Table #Orphans 
+ (
+  RowID     int not null primary key identity(1,1) ,
+  TDBName varchar (100),
+  UserName varchar (100),
+  UserSid varbinary(85)
+ )
+SET NOCOUNT ON 
+ DECLARE @DBName sysname, @Qry nvarchar(4000)
+ SET @Qry = ''
+ SET @DBName = ''
+ WHILE @DBName IS NOT NULL
+ BEGIN
+   SET @DBName = 
+     (
+  SELECT MIN(name) 
+   FROM master..sysdatabases 
+   WHERE
+   /** to exclude named databases add them to the Not In clause **/
+   name NOT IN 
+     (
+      'model', 'msdb', 
+      'distribution'
+     ) And 
+     DATABASEPROPERTY(name, 'IsOffline') = 0 
+     AND DATABASEPROPERTY(name, 'IsSuspect') = 0 
+     AND name > @DBName
+      )
+   IF @DBName IS NULL BREAK
+         
+                Set @Qry = 'select ''' + @DBName + ''' as DBName, name AS UserName, 
+                sid AS UserSID from [' + @DBName + ']..sysusers 
+                where issqluser = 1 and (sid is not null and sid <> 0x0) 
+                and suser_sname(sid) is null order by name'
+ Insert into #Orphans Exec (@Qry)
+ 
+ End
+Select * from #Orphans
+/** To drop orphans uncomment this section 
+Declare @SQL as varchar (200)
+Declare @DDBName varchar (100)
+Declare @Orphanname varchar (100)
+Declare @DBSysSchema varchar (100)
+Declare @From int
+Declare @To int
+Select @From = 0, @To = @@ROWCOUNT 
+from #Orphans
+--Print @From
+--Print @To
+While @From < @To
+ Begin
+  Set @From = @From + 1
+  
+  Select @DDBName = TDBName, @Orphanname = UserName from #Orphans
+   Where RowID = @From
+      
+   Set @DBSysSchema = '[' + @DDBName + ']' + '.[sys].[schemas]'
+   print @DBsysSchema
+   Print @DDBname
+   Print @Orphanname
+   set @SQL = 'If Exists (Select * from ' + @DBSysSchema 
+                          + ' where name = ''' + @Orphanname + ''')
+    Begin
+     Use ' + @DDBName 
+                                        + ' Drop Schema [' + @Orphanname + ']
+    End'
+   print @SQL
+   Exec (@SQL)
+     
+    Begin Try
+     Set @SQL = 'Use ' + @DDBName 
+                                        + ' Drop User [' + @Orphanname + ']'
+     Exec (@SQL)
+    End Try
+    Begin Catch
+    End Catch
+   
+ End
+**/
+ 
+Drop table #Orphans
+
+---run for memory issue 
+SELECT physical_memory_in_use_kb,locked_page_allocations_kb,
+       page_fault_count, memory_utilization_percentage,
+       available_commit_limit_kb, process_physical_memory_low,
+       process_virtual_memory_low
+FROM sys.dm_os_process_memory WITH (NOLOCK) OPTION (RECOMPILE);
+
+--You may run this for Server Memory
+SELECT total_physical_memory_kb, available_physical_memory_kb,
+       total_page_file_kb, available_page_file_kb,
+       system_memory_state_desc
+FROM sys.dm_os_sys_memory WITH (NOLOCK) OPTION (RECOMPILE);
+
+
+-----
+set nocount on
+go
+
+if exists (
+        select 1
+        from sys.databases
+        where recovery_model_desc = 'SIMPLE'
+            and state_desc = 'ONLINE'
+        )
+begin
+    print '-- You are setting up database to FULL recovery mode. '
+    print '-- Make sure you take first full backup and then schedule LOG BACKUPS for proper transaction log maintenance !'
+
+    select 'ALTER DATABASE ' + QUOTENAME(name) + ' SET RECOVERY FULL with ROLLBACK IMMEDIATE;'
+    from sys.databases
+    where recovery_model_desc = 'SIMPLE' -- since you only want SIMPLE recovery model databases to get changed to FULL recovery.
+            and state_desc = 'ONLINE'
+end
+
+
+go 
+
+--*************************************************************************************
+--In the directory with all the text files, execute the following:
+
+--for %f in (*.txt) do type "%f" >> combined.txt
+--This will merge all files matching *.txt into one file called combined.txt. %
+
+--*************************************************************************************
+
+
+Select DB_NAME(database_id) Database_name , OBJECT_NAME(object_id) Object_n,  * from sys.dm_db_index_physical_stats 
+(NULL, NULL, NULL , NULL, NULL  )
+-- Check VLFs status 
+
+
+DECLARE @logInfoResults AS TABLE
+(
+ [RecoveryUnitId] BIGINT, -- only on SQL Server 2012 and newer
+ [FileId] TINYINT,
+ [FileSize] BIGINT,
+ [StartOffset] BIGINT,
+ [FSeqNo] INTEGER,
+ [Status] TINYINT,
+ [Parity] TINYINT,
+ [CreateLSN] NUMERIC(38,0)
+);
+ 
+INSERT INTO @logInfoResults
+EXEC sp_executesql N'DBCC LOGINFO WITH NO_INFOMSGS';
+ 
+SELECT cast(FileSize / 1024.0 / 1024 AS DECIMAL(20,1)) as FileSizeInMB,
+case when FSeqNo = 0 then 'Available - Never Used' else (Case when status = 2 then 'In Use' else 'Available' end) end as TextStatus,
+[Status] ,
+REPLICATE('x', FileSize / MIN(FileSize) over()) as [BarChart ________________________________________________________________________________________________]
+FROM @logInfoResults ;
+
+------Auto growth setting 
+-- Drop temporary table if it exists
+IF OBJECT_ID('tempdb..#info') IS NOT NULL
+       DROP TABLE #info;
+ 
+-- Create table to house database file information
+CREATE TABLE #info (
+     databasename VARCHAR(128)
+     ,name VARCHAR(128)
+    ,fileid INT
+    ,filename VARCHAR(1000)
+    ,filegroup VARCHAR(128)
+    ,size VARCHAR(25)
+    ,maxsize VARCHAR(25)
+    ,growth VARCHAR(25)
+    ,usage VARCHAR(25));
+    
+-- Get database file information for each database   
+SET NOCOUNT ON; 
+INSERT INTO #info
+EXEC sp_MSforeachdb 'use ? 
+select ''?'',name,  fileid, filename,
+filegroup = filegroup_name(groupid),
+''size'' = convert(nvarchar(15), convert (bigint, size) * 8) + N'' KB'',
+''maxsize'' = (case maxsize when -1 then N''Unlimited''
+else
+convert(nvarchar(15), convert (bigint, maxsize) * 8) + N'' KB'' end),
+''growth'' = (case status & 0x100000 when 0x100000 then
+convert(nvarchar(15), growth) + N''%''
+else
+convert(nvarchar(15), convert (bigint, growth) * 8) + N'' KB'' end),
+''usage'' = (case status & 0x40 when 0x40 then ''log only'' else ''data only'' end)
+from sysfiles
+';
+ 
+-- Identify database files that use default auto-grow properties
+SELECT databasename AS [Database Name]
+      ,name AS [Logical Name]
+      ,filename AS [Physical File Name]
+      ,growth AS [Auto-grow Setting], maxsize FROM #info 
+WHERE (usage = 'data only' AND growth = '1024 KB') 
+   OR (usage = 'log only' AND growth = '10%')
+ORDER BY databasename
+ 
+-- get rid of temp table 
+DROP TABLE #info;
+
+
+------------get the last growth in database files 
+
+DECLARE @filename NVARCHAR(1000);
+DECLARE @bc INT;
+DECLARE @ec INT;
+DECLARE @bfn VARCHAR(1000);
+DECLARE @efn VARCHAR(10);
+ 
+-- Get the name of the current default trace
+SELECT @filename = CAST(value AS NVARCHAR(1000))
+FROM ::fn_trace_getinfo(DEFAULT)
+WHERE traceid = 1 AND property = 2;
+ 
+-- rip apart file name into pieces
+SET @filename = REVERSE(@filename);
+SET @bc = CHARINDEX('.',@filename);
+SET @ec = CHARINDEX('_',@filename)+1;
+SET @efn = REVERSE(SUBSTRING(@filename,1,@bc));
+SET @bfn = REVERSE(SUBSTRING(@filename,@ec,LEN(@filename)));
+ 
+-- set filename without rollover number
+SET @filename = @bfn + @efn
+ 
+-- process all trace files
+SELECT top 500
+  ftg.StartTime
+,te.name AS EventName
+,DB_NAME(ftg.databaseid) AS DatabaseName  
+,ftg.Filename
+,(ftg.IntegerData*8)/1024.0 AS GrowthMB 
+,(ftg.duration/1000)AS DurMS
+FROM ::fn_trace_gettable(@filename, DEFAULT) AS ftg 
+INNER JOIN sys.trace_events AS te ON ftg.EventClass = te.trace_event_id  
+WHERE (ftg.EventClass = 92  -- Date File Auto-grow
+    OR ftg.EventClass = 93) -- Log File Auto-grow
+ORDER BY ftg.StartTime desc 
+
+--------------modify auto growth 
+SET NOCOUNT ON;  
+SELECT  'USE [MASTER] ' + CHAR(13) + 'ALTER DATABASE [' + d.name + N'] '
+    + 'MODIFY FILE (NAME = N''' + mf.name + N''', FILEGROWTH = 100 MB)'
+    + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10)
+	+'GO'
+FROM    sys.master_files mf
+    JOIN sys.databases d ON mf.database_id = d.database_id
+WHERE   d.database_id > 4
+    AND d.state_desc <> 'offline'
+    AND mf.type_desc = 'ROWS';
+	
+	----------index blocking and more Identifying Top Objects Associated with Lock Contention
+	
+SELECT      TOP 3
+
+            OBJECT_NAME(o.object_id, o.database_id) object_nm,
+
+            o.index_id,
+
+            partition_number,
+
+            page_lock_wait_count,
+
+            page_lock_wait_in_ms,
+
+            case when mid.database_id is null then ‘N’ else ‘Y’ end as missing_index_identified
+
+FROM sys.dm_db_index_operational_stats (db_id(), NULL, NULL, NULL) o
+
+LEFT OUTER JOIN (SELECT DISTINCT database_id, object_id
+
+                         FROM sys.dm_db_missing_index_details) as mid 
+
+      ON mid.database_id = o.database_id and mid.object_id = o.object_id
+
+ORDER BY page_lock_wait_count DESC
+
+
+---Lock Escalations
+
+SELECT      TOP 3
+
+            OBJECT_NAME(object_id, database_id) object_nm,
+
+            index_id,
+
+            partition_number,
+
+            index_lock_promotion_attempt_count,
+
+            index_lock_promotion_count
+
+FROM sys.dm_db_index_operational_stats
+
+      (db_id(), NULL, NULL, NULL)
+
+ORDER BY index_lock_promotion_count DESC
+
+--Page Split Tracking
+
+
+
+SELECT      TOP 10
+
+            OBJECT_NAME(object_id, database_id) object_nm,
+
+            index_id,
+
+            partition_number,
+
+            leaf_allocation_count,
+
+            nonleaf_allocation_count
+
+FROM sys.dm_db_index_operational_stats
+
+      (db_id(), NULL, NULL, NULL)
+
+ORDER BY leaf_allocation_count DESC
+
+
+--- Change eventinfo to nvarchar(4000) for sql 2005 and 2008
+CREATE TABLE #B(eventtype nvarchar(30), parameters int, eventinfo nvarchar(255)) 
+INSERT INTO #B(EventType, Parameters, EventInfo) 
+EXEC ('dbcc inputbuffer (' + @@spid + ') with no_infomsgs')
+
+DECLARE @handle varbinary(64)
+SELECT @handle = MAX(sql_handle) FROM master..sysprocesses WHERE spid = @@SPID
+
+SELECT * FROM ::fn_get_sql(@handle)
+-- OR --
+CREATE TABLE #C(dbid smallint, objectid int, number smallint, encrypted bit, [text] text)  
+INSERT INTO #C(DBID, ObjectID, Number, Encrypted, [Text])  
+SELECT * FROM ::fn_get_sql(@Handle)  
