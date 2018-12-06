@@ -212,9 +212,6 @@ SELECT Name, log_reuse_wait_desc FROM sys.databases
 --You could be waiting on a long transaction, or on a log backup, or on replication, etc.--
 
 
-Accurate TM_PROD 
-
-U9hcmwr7H6JIc9DfWdr7
 
 --Create the database audit specification in each database 
 
