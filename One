@@ -902,7 +902,7 @@ SELECT DB_NAME([database_id]) AS [Database Name],
  
  
   -- Volume info for all LUNS that have database files on the current instance (Query 23) (Volume Info)
- SELECT DISTINCT vs.volume_mount_point, vs.file_system_type, 
+ SELECT DISTINCT @@SERVERNAME AS SERVERNAME,   vs.volume_mount_point, vs.file_system_type, 
  vs.logical_volume_name, CONVERT(DECIMAL(18,2),vs.total_bytes/1073741824.0) AS [Total Size (GB)],
  CONVERT(DECIMAL(18,2),vs.available_bytes/1073741824.0) AS [Available Size (GB)],  
  CAST(CAST(vs.available_bytes AS FLOAT)/ CAST(vs.total_bytes AS FLOAT) AS DECIMAL(18,2)) * 100 AS [Space Free %] 
@@ -2423,13 +2423,12 @@ FROM [ProcessorInfo]
 
 
 --Your ‘cbs\’ LAN account is not locked.
+--Your ‘cbs\’ LAN account is not locked.
 
 --Please go to the following website to change your ‘cbs\’ LAN account password: ----https://orlvmrdweb.cbs.fiserv.net/RDWeb/Pages/en-US/password.aspx 
 
 ----------------------
-WITH CTE_MAIN
-AS
-(/****** Script for SelectTopNRows command from SSMS  ******/
+
 SELECT  [collection_time] ,  [dd hh:mm:ss.mss]
       ,[session_id]  ,[blocking_session_id]
       ,[blocked_session_count]
@@ -2460,13 +2459,12 @@ SELECT  [collection_time] ,  [dd hh:mm:ss.mss]
      
   FROM [DBA_DB].[dbo].[WhowasActive]
 
-  Where collection_time between '2018-09-10 08:00:55.190' AND '2018-09-10 20:00:55.190' 
-  --and blocking_session_id is not null 
-  )
-  select * from CTE_MAIN where blocking_session_id is not null 
-  UNION
-  select * from CTE_MAIN where blocked_session_count>0-- session_id in (select blocking_session_id from CTE_MAIN where blocking_session_id is not null) 
-  order by 1,4
+  Where collection_time between '2019-01-23 22:00:55.190' AND '2019-01-24 07:00:55.190' 
+  AND 
+ ( blocking_session_id is not null 
+ OR 
+ blocked_session_count>0 ) -- session_id in (select blocking_session_id from CTE_MAIN where blocking_session_id is not null) 
+
 
 --Any further assistance let us know.
 
@@ -2705,3 +2703,433 @@ OPTION (HASH JOIN, MERGE JOIN);
  
  INSERT INTO dbo.Switcharoo (id) SELECT TOP 1000000 N FROM Nums ORDER BY N;
 
+--------------------------------------------------------------------
+--Database file size and space free for all dbs 
+
+
+
+SET NOCOUNT ON
+DECLARE @DBName NVARCHAR(100) = NULL, --Provide DBName if looking for a specific database or leave to get all databases details
+        @Drive NVARCHAR(2) = NULL --Mention drive letter if you are concerned of only a single drive where you are running out of space
+ 
+DECLARE @cmd NVARCHAR(4000)
+IF (SELECT OBJECT_ID('tempdb.dbo.#DBName')) IS NOT NULL
+DROP TABLE #DBName
+CREATE TABLE #DBName (Name NVARCHAR(100))
+ 
+IF @DBName IS NOT NULL
+INSERT INTO #DBName SELECT @DBName
+ELSE
+INSERT INTO #DBName SELECT Name FROM sys.databases WHERE state_desc = 'ONLINE'
+ 
+IF (SELECT OBJECT_ID('tempdb.dbo.##FileStats')) IS NOT NULL
+DROP TABLE ##FileStats
+CREATE TABLE ##FileStats (ServerName NVARCHAR(100), DBName NVARCHAR(100), FileType NVARCHAR(100), 
+FileName NVARCHAR(100), CurrentSizeMB FLOAT, FreeSpaceMB FLOAT, PercentMBFree FLOAT, FileLocation NVARCHAR(1000))
+ 
+WHILE (SELECT TOP 1 * FROM #DBName) IS NOT NULL
+BEGIN
+ 
+    SELECT @DBName = MIN(Name) FROM #DBName
+ 
+    SET @cmd = 'USE [' + @DBName + ']
+    INSERT INTO ##FileStats
+    SELECT @@ServerName AS ServerName, DB_NAME() AS DbName, 
+    CASE WHEN type = 0 THEN ''DATA'' ELSE ''LOG'' END AS FileType,
+    name AS FileName, 
+    size/128.0 AS CurrentSizeMB,  
+    size/128.0 - CAST(FILEPROPERTY(name, ''SpaceUsed'') AS INT)/128.0 AS FreeSpaceMB,
+    100*(1 - ((CAST(FILEPROPERTY(name, ''SpaceUsed'') AS INT)/128.0)/(size/128.0))) AS PercentMBFree,
+    physical_name AS FileLocation
+    FROM sys.database_files'
+     
+    IF @Drive IS NOT NULL
+    SET @cmd = @cmd + ' WHERE physical_name LIKE ''' + @Drive + ':\%'''
+ 
+    EXEC sp_executesql @cmd
+     
+    DELETE FROM #DBName WHERE Name = @DBName
+     
+END
+ 
+SELECT FreeSpaceMB*100/CurrentSizeMB AS PercentFree, * FROM ##FileStats
+ORDER BY FreeSpaceMB DESC
+ 
+DROP TABLE #DBName
+DROP TABLE ##FileStats
+---------------------------
+
+--REstore command for multiple databases 
+
+
+*/
+SET NOCOUNT ON;
+
+--Variable for finding .bak files
+DECLARE
+       @BasePath varchar(1000)
+      ,@Path varchar(1000)
+      ,@FullPath varchar(2000)
+      ,@Id int
+      ,@RowCount int;
+
+--1) specify database backup directory
+SET @BasePath = 'F:\Backups';
+
+--2) Overwrite DB ( 1=TRUE   OR   0=FALSE  )
+DECLARE	@do_overwrite_db TINYINT
+SET		@do_overwrite_db = 0
+
+--3) NORECOVERY Mode (1=TRUE   OR   0=FALSE  )
+DECLARE	@with_NORECOVERY TINYINT
+SET		@with_NORECOVERY = 0
+
+DECLARE	@Target_Data_Path NVARCHAR (250),
+		@Target_Log_Path NVARCHAR (250)
+
+PRINT '/* Please ignore this message ';
+--Queries to find Data & Log files path  /* SELECT name, filename FROM master.sys.sysaltfiles */
+DECLARE @DefaultLog nvarchar(512)
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultLog', @DefaultLog output
+
+DECLARE @MasterData nvarchar(512)
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer\Parameters', N'SqlArg0', @MasterData output
+SELECT @MasterData=substring(@MasterData, 3, 255)
+SELECT @MasterData=substring(@MasterData, 1, len(@MasterData) - charindex('\', reverse(@MasterData)))
+
+SELECT	@Target_Data_Path = COALESCE(CONVERT(NVARCHAR(250),SERVERPROPERTY('instancedefaultdatapath')), @MasterData+'\', '<Data File Location>')
+		,@Target_Log_Path = COALESCE(CONVERT(NVARCHAR(250),SERVERPROPERTY('instancedefaultlogpath')), @DefaultLog+'\', '<Log File Location>') 
+PRINT '
+*/ ';
+
+-- Variables for Scripting out restore script
+DECLARE @db_name NVARCHAR(100)
+		,@DatabaseFileId TINYINT
+		,@LogicalName NVARCHAR(150)
+		,@DatabaseFileType VARCHAR(2)
+		,@Maiden_File_Name NVARCHAR(100)
+		,@PhysicalName NVARCHAR(150)
+		,@SQLString NVARCHAR(max)
+		,@DataLogFileCount TINYINT
+		,@DataLogFileCounter TINYINT
+		,@FileCount TINYINT
+		,@FileCounter TINYINT
+		,@BackupFile VARCHAR(2000)
+		,@DatabaseFile VARCHAR(2000);
+
+DECLARE @DirectoryTree TABLE
+(
+       id int IDENTITY(1,1)
+      ,fullpath varchar(2000)
+      ,subdirectory nvarchar(512)
+      ,depth int
+      ,isfile bit
+);
+
+DECLARE @BackupFileList TABLE( id int IDENTITY(1,1), BackupFile VARCHAR(2000) );
+
+CREATE TABLE #headers
+( BackupName varchar(256), BackupDescription varchar(256), BackupType varchar(256), 
+ExpirationDate varchar(256), Compressed varchar(256), Position varchar(256), DeviceType varchar(256), 
+UserName varchar(256), ServerName varchar(256), DatabaseName varchar(256), DatabaseVersion varchar(256), 
+DatabaseCreationDate varchar(256), BackupSize varchar(256), FirstLSN varchar(256), LastLSN varchar(256), 
+CheckpointLSN varchar(256), DatabaseBackupLSN varchar(256), BackupStartDate varchar(256), BackupFinishDate varchar(256), 
+SortOrder varchar(256), CodePage varchar(256), UnicodeLocaleId varchar(256), UnicodeComparisonStyle varchar(256), 
+CompatibilityLevel varchar(256), SoftwareVendorId varchar(256), SoftwareVersionMajor varchar(256), 
+SoftwareVersionMinor varchar(256), SoftwareVersionBuild varchar(256), MachineName varchar(256), Flags varchar(256), 
+BindingID varchar(256), RecoveryForkID varchar(256), Collation varchar(256), FamilyGUID varchar(256), 
+HasBulkLoggedData varchar(256), IsSnapshot varchar(256), IsReadOnly varchar(256), IsSingleUser varchar(256), 
+HasBackupChecksums varchar(256), IsDamaged varchar(256), BeginsLogChain varchar(256), HasIncompleteMetaData varchar(256), 
+IsForceOffline varchar(256), IsCopyOnly varchar(256), FirstRecoveryForkID varchar(256), ForkPointLSN varchar(256), 
+RecoveryModel varchar(256), DifferentialBaseLSN varchar(256), DifferentialBaseGUID varchar(256), 
+BackupTypeDescription varchar(256), BackupSetGUID varchar(256), CompressedBackupSize varchar(256), 
+Containment varchar(256) ); 
+
+-- Drop Containment column from #headers for SQL Server 2008 R2
+IF (SELECT CONVERT(VARCHAR(50),SERVERPROPERTY('productversion'))) LIKE '10.50.%'
+BEGIN
+	ALTER TABLE #headers
+		DROP COLUMN Containment;
+END
+
+DECLARE @Backup_File_Details table
+(
+    LogicalName          nvarchar(128),
+    PhysicalName         nvarchar(260),
+    [Type]               char(1),
+    FileGroupName        nvarchar(128),
+    Size                 numeric(20,0),
+    MaxSize              numeric(20,0),
+    FileID               bigint,
+    CreateLSN            numeric(25,0),
+    DropLSN              numeric(25,0),
+    UniqueID             uniqueidentifier,
+    ReadOnlyLSN          numeric(25,0),
+    ReadWriteLSN         numeric(25,0),
+    BackupSizeInBytes    bigint,
+    SourceBlockSize      int,
+    FileGroupID          int,
+    LogGroupGUID         uniqueidentifier,
+    DifferentialBaseLSN  numeric(25,0),
+    DifferentialBaseGUID uniqueidentifier,
+    IsReadOnl            bit,
+    IsPresent            bit,
+    TDEThumbprint        varbinary(32) -- remove this column if using SQL 2005
+)
+
+--Populate the table using the initial base path.
+INSERT @DirectoryTree (subdirectory,depth,isfile) EXEC master.sys.xp_dirtree @BasePath,1,1;
+
+UPDATE @DirectoryTree SET fullpath = @BasePath + '\' + subdirectory;
+INSERT INTO @BackupFileList SELECT fullpath FROM @DirectoryTree WHERE isfile = 1;
+DELETE FROM @DirectoryTree WHERE isfile = 1;
+
+--Loop through the table as long as there are still folders to process.
+WHILE EXISTS (SELECT id FROM @DirectoryTree WHERE isfile = 0)
+BEGIN
+
+	SELECT TOP (1) @Id = id, @BasePath = fullpath FROM @DirectoryTree WHERE isfile = 0;
+	
+	SET NOCOUNT ON;
+	INSERT @DirectoryTree (subdirectory,depth,isfile) EXEC master.sys.xp_dirtree @BasePath,1,1;
+	SET @RowCount = @@ROWCOUNT ;
+	
+	IF @RowCount <> 0
+		UPDATE @DirectoryTree SET fullpath = @BasePath + '\' + subdirectory WHERE id = @@IDENTITY;
+	ELSE
+		PRINT 'NOTE: Backup missing on path = '+@BasePath;
+	
+	--Delete the processed folder.
+    DELETE FROM @DirectoryTree WHERE id = @Id;
+END;
+
+--Prepare Final list of .bak Files from Base Path
+INSERT INTO @BackupFileList SELECT fullpath FROM @DirectoryTree WHERE isfile = 1;
+--SELECT * from @BackupFileList;
+
+--*****************************************************************************************
+--*****************************************************************************************
+--*****************************************************************************************
+
+--Loop through each Backup File
+DECLARE BackupFile_cursor CURSOR FOR 
+	SELECT ROW_NUMBER()OVER(ORDER BY BackupFile) AS id, BackupFile FROM @BackupFileList ORDER BY BackupFile;
+
+OPEN BackupFile_cursor
+FETCH NEXT FROM BackupFile_cursor INTO @id, @BackupFile;
+
+WHILE @@FETCH_STATUS = 0 
+BEGIN
+	BEGIN TRY
+	--Get Header info. One row per .bak file
+	INSERT INTO #headers
+	EXEC ('restore headeronly from disk = '''+ @BackupFile + '''');
+	
+	SELECT @db_name = DatabaseName FROM #headers;
+
+	--Get Data & Log Files. Two or more rows per .bak file
+	INSERT INTO @Backup_File_Details
+	EXEC ('restore filelistonly from disk = '''+ @BackupFile + '''');
+
+	SET	@DataLogFileCount = (SELECT COUNT(1) AS COUNTS FROM @Backup_File_Details);
+	SET @DataLogFileCounter = 1;
+
+	SET @SQLString =  '
+--	'+CAST(@id AS VARCHAR(3))+') ['+ @db_name +']
+restore database ['+ @db_name +'] from disk ='''+@BackupFile+ '''
+with ';
+
+	WHILE (@DataLogFileCounter <= @DataLogFileCount)
+	BEGIN
+	
+		SELECT	@LogicalName = LogicalName 
+				,@PhysicalName = RIGHT(physicalname,CHARINDEX('\',REVERSE(physicalname))-1)
+				,@DatabaseFileType = Type
+				,@DatabaseFileId = FileId
+		FROM @Backup_File_Details WHERE FileId = @DataLogFileCounter;
+	
+		if(@DatabaseFileType='D')
+		SET @SQLString =  @SQLString + 
+			'move '''+ @LogicalName +''' to ''' + @Target_Data_Path + @PhysicalName +''',
+	 ';
+		if(@DatabaseFileType='L')
+			SET @SQLString =  @SQLString + 
+			'move '''+ @LogicalName +''' to ''' + @Target_Log_Path + @PhysicalName +''',
+	 ';
+
+		SET @DataLogFileCounter = @DataLogFileCounter + 1;
+	END;
+
+	if (@do_overwrite_db<>0)
+		SET @SQLString =  @SQLString + 'replace ,';
+	if (@with_NORECOVERY<>0)
+		SET @SQLString = @SQLString + 'NORECOVERY ,';
+	SET @SQLString =  @SQLString + 'STATS = 10
+GO
+
+'  ;
+
+	PRINT	@SQLString;
+	DELETE FROM @Backup_File_Details;
+	DELETE FROM #headers;
+	
+	END TRY
+	BEGIN CATCH
+		PRINT	'--	'+CAST(@id AS VARCHAR(3))+')
+Error Occurred with Message: '+ ERROR_MESSAGE();
+		IF (ERROR_MESSAGE()='RESTORE HEADERONLY is terminating abnormally.')
+		PRINT'HINT:	Kindly check if backup path "'+@BackupFile + '" exists
+
+';
+		ELSE
+		IF (ERROR_MESSAGE()='RESTORE FILELIST is terminating abnormally.')
+		PRINT'HINT:	Backup File "'+@BackupFile + '" belongs to higher version of SQL Server
+
+';
+
+	END CATCH
+
+FETCH NEXT FROM BackupFile_cursor INTO @id, @BackupFile;
+END
+
+CLOSE BackupFile_cursor 
+DEALLOCATE BackupFile_cursor 
+DROP TABLE #headers;
+'
+-----------------------------------------
+---------------------------- Multiple files in multiple folder to one 
+
+$files = Get-ChildItem -Path E:\TM_CRM -Recurse -File 
+ foreach ($file in $files)
+{
+  $strippedFileName = $file.BaseName;
+  $extension = $file.Extension;
+  $crtime=Get-Random;
+  $sourceFilePath = $file.DirectoryName;
+  $DestinationFile = "E:\TM_ALL\" + $strippedFileName +$crtime + $extension;
+  Copy-Item $file.FullName  -Destination $DestinationFile -Recurse -Force
+}
+
+
+
+
+Get-ChildItem E:\TM_ALL\Old_perf\*.csv | foreach { Get-Content $_ } | sort -Unique | Out-File E:\TM_ALL\Old_perf.csv -Encoding ascii
+
+C:\Windows\system32>relog "E:\ESF_ALL\split_perf.csv" -f SQL -o SQL:Perf!Perfmon_data
+
+-----------------------------------------------------
+
+---- 
+
+--Blocking for all 
+
+WITH [Blocking]
+AS (SELECT w.[session_id]
+   ,s.[original_login_name]
+   ,s.[login_name]
+   ,w.[wait_duration_ms]
+   ,w.[wait_type]
+   ,r.[status]
+   ,r.[wait_resource]
+   ,w.[resource_description]
+   ,s.[program_name]
+   ,w.[blocking_session_id]
+   ,s.[host_name]
+   ,r.[command]
+   ,r.[percent_complete]
+   ,r.[cpu_time]
+   ,r.[total_elapsed_time]
+   ,r.[reads]
+   ,r.[writes]
+   ,r.[logical_reads]
+   ,r.[row_count]
+   ,q.[text]
+   ,q.[dbid]
+   ,p.[query_plan]
+   ,r.[plan_handle]
+ FROM [sys].[dm_os_waiting_tasks] w
+ INNER JOIN [sys].[dm_exec_sessions] s ON w.[session_id] = s.[session_id]
+ INNER JOIN [sys].[dm_exec_requests] r ON s.[session_id] = r.[session_id]
+ CROSS APPLY [sys].[dm_exec_sql_text](r.[plan_handle]) q
+ CROSS APPLY [sys].[dm_exec_query_plan](r.[plan_handle]) p
+ WHERE w.[session_id] > 50
+  AND w.[wait_type] NOT IN ('DBMIRROR_DBM_EVENT'
+      ,'ASYNC_NETWORK_IO'))
+SELECT b.[session_id] AS [WaitingSessionID]
+      ,b.[blocking_session_id] AS [BlockingSessionID]
+      ,b.[login_name] AS [WaitingUserSessionLogin]
+      ,s1.[login_name] AS [BlockingUserSessionLogin]
+      ,b.[original_login_name] AS [WaitingUserConnectionLogin] 
+      ,s1.[original_login_name] AS [BlockingSessionConnectionLogin]
+      ,b.[wait_duration_ms] AS [WaitDuration]
+      ,b.[wait_type] AS [WaitType]
+      ,t.[request_mode] AS [WaitRequestMode]
+      ,UPPER(b.[status]) AS [WaitingProcessStatus]
+      ,UPPER(s1.[status]) AS [BlockingSessionStatus]
+      ,b.[wait_resource] AS [WaitResource]
+      ,t.[resource_type] AS [WaitResourceType]
+      ,t.[resource_database_id] AS [WaitResourceDatabaseID]
+      ,DB_NAME(t.[resource_database_id]) AS [WaitResourceDatabaseName]
+      ,b.[resource_description] AS [WaitResourceDescription]
+      ,b.[program_name] AS [WaitingSessionProgramName]
+      ,s1.[program_name] AS [BlockingSessionProgramName]
+      ,b.[host_name] AS [WaitingHost]
+      ,s1.[host_name] AS [BlockingHost]
+      ,b.[command] AS [WaitingCommandType]
+      ,b.[text] AS [WaitingCommandText]
+      ,b.[row_count] AS [WaitingCommandRowCount]
+      ,b.[percent_complete] AS [WaitingCommandPercentComplete]
+      ,b.[cpu_time] AS [WaitingCommandCPUTime]
+      ,b.[total_elapsed_time] AS [WaitingCommandTotalElapsedTime]
+      ,b.[reads] AS [WaitingCommandReads]
+      ,b.[writes] AS [WaitingCommandWrites]
+      ,b.[logical_reads] AS [WaitingCommandLogicalReads]
+      ,b.[query_plan] AS [WaitingCommandQueryPlan]
+      ,b.[plan_handle] AS [WaitingCommandPlanHandle]
+FROM [Blocking] b
+INNER JOIN [sys].[dm_exec_sessions] s1
+ON b.[blocking_session_id] = s1.[session_id]
+INNER JOIN [sys].[dm_tran_locks] t
+ON t.[request_session_id] = b.[session_id]
+WHERE t.[request_status] = 'WAIT'
+GO
+"-----------partitions SQL server 
+
+DECLARE @TableName NVARCHAR(200) = N'AlertRuleResultLog_tmp'
+ 
+SELECT SCHEMA_NAME(o.schema_id) + '.' + OBJECT_NAME(i.object_id) AS [object]
+     , p.partition_number AS [p#]
+     , fg.name AS [filegroup]
+     , p.rows
+     , au.total_pages AS pages
+     , CASE boundary_value_on_right
+       WHEN 1 THEN 'less than'
+       ELSE 'less than or equal to' END as comparison
+     , rv.value
+     , CONVERT (VARCHAR(6), CONVERT (INT, SUBSTRING (au.first_page, 6, 1) +
+       SUBSTRING (au.first_page, 5, 1))) + ':' + CONVERT (VARCHAR(20),
+       CONVERT (INT, SUBSTRING (au.first_page, 4, 1) +
+       SUBSTRING (au.first_page, 3, 1) + SUBSTRING (au.first_page, 2, 1) +
+       SUBSTRING (au.first_page, 1, 1))) AS first_page
+FROM sys.partitions p
+INNER JOIN sys.indexes i
+     ON p.object_id = i.object_id
+AND p.index_id = i.index_id
+INNER JOIN sys.objects o
+     ON p.object_id = o.object_id
+INNER JOIN sys.system_internals_allocation_units au
+     ON p.partition_id = au.container_id
+INNER JOIN sys.partition_schemes ps
+     ON ps.data_space_id = i.data_space_id
+INNER JOIN sys.partition_functions f
+     ON f.function_id = ps.function_id
+INNER JOIN sys.destination_data_spaces dds
+     ON dds.partition_scheme_id = ps.data_space_id
+     AND dds.destination_id = p.partition_number
+INNER JOIN sys.filegroups fg
+     ON dds.data_space_id = fg.data_space_id
+LEFT OUTER JOIN sys.partition_range_values rv
+     ON f.function_id = rv.function_id
+     AND p.partition_number = rv.boundary_id
+WHERE i.index_id < 2
+     AND o.object_id = OBJECT_ID(@TableName);
